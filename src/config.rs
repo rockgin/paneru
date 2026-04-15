@@ -174,6 +174,7 @@ fn parse_operation(argv: &[&str]) -> Result<Operation> {
         "focus" => Operation::Focus(parse_direction(argv.get(1).ok_or(err)?)?),
         "swap" => Operation::Swap(parse_direction(argv.get(1).ok_or(err)?)?),
         "center" => Operation::Center,
+        "rightwithgap" => Operation::RightWithGap,
         "resize" => Operation::Resize(
             argv.get(1)
                 .map_or(Ok(ResizeDirection::Grow), |arg| parse_resize_direction(arg))?,
