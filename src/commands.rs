@@ -37,6 +37,55 @@ pub enum ResizeDirection {
     Shrink,
 }
 
+/// Direction used for pixel-based resizing.
+#[derive(Clone, Copy, Debug)]
+pub enum ResizeAxis {
+    Width,
+    Height,
+}
+
+/// Direction used for pixel-based resizing with amount.
+#[derive(Clone, Copy, Debug)]
+pub struct ResizeBy {
+    pub axis: ResizeAxis,
+    pub amount: i32,
+    pub grow: bool,
+}
+
+impl ResizeBy {
+    pub fn grow_width() -> Self {
+        Self {
+            axis: ResizeAxis::Width,
+            amount: 100,
+            grow: true,
+        }
+    }
+
+    pub fn shrink_width() -> Self {
+        Self {
+            axis: ResizeAxis::Width,
+            amount: 100,
+            grow: false,
+        }
+    }
+
+    pub fn grow_height() -> Self {
+        Self {
+            axis: ResizeAxis::Height,
+            amount: 100,
+            grow: true,
+        }
+    }
+
+    pub fn shrink_height() -> Self {
+        Self {
+            axis: ResizeAxis::Height,
+            amount: 100,
+            grow: false,
+        }
+    }
+}
+
 /// Controls whether focus follows the window after a move operation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MoveFocus {
@@ -55,6 +104,8 @@ pub enum Operation {
     Center,
     /// Resizes the focused window in the given direction.
     Resize(ResizeDirection),
+    /// Resizes the focused window by pixels (width/height +/- 100px).
+    ResizeBy(ResizeBy),
     /// Toggles the focused window to full width or a preset width.
     FullWidth,
     /// Moves the focused window to the next available display.
@@ -101,6 +152,7 @@ pub fn register_commands(app: &mut bevy::app::App) {
             print_internal_state_handler,
             mouse_to_next_display,
             resize_window,
+            resize_by_pixels,
             command_center_window,
             full_width_window,
             to_next_display,
@@ -475,6 +527,87 @@ fn resize_window(
     }
 
     resize_entity(entity, size, &mut commands);
+    reshuffle_around(entity, &mut commands);
+}
+
+/// Resizes the focused window by a fixed pixel amount (width or height).
+///
+/// Width changes expand/shrink from the right edge.
+/// Height changes expand/shrink from the top edge (upward growth).
+#[allow(clippy::needless_pass_by_value)]
+fn resize_by_pixels(
+    mut messages: MessageReader<Event>,
+    windows: Windows,
+    active_display: ActiveDisplay,
+    config: Res<Config>,
+    mut commands: Commands,
+) {
+    let Some(Operation::ResizeBy(resize)) =
+        filter_window_operations(&mut messages, |op| matches!(op, Operation::ResizeBy(_))).next()
+    else {
+        return;
+    };
+
+    let Some((frame, entity)) = windows
+        .focused()
+        .and_then(|(_, entity)| windows.frame(entity).zip(Some(entity)))
+    else {
+        return;
+    };
+
+    let new_size = match resize.axis {
+        ResizeAxis::Width => {
+            let mut new_width = frame.width();
+            if resize.grow {
+                new_width += resize.amount;
+            } else {
+                new_width = (new_width - resize.amount).max(100);
+            }
+            Size::new(new_width, frame.height())
+        }
+        ResizeAxis::Height => {
+            let mut new_height = frame.height();
+            if resize.grow {
+                new_height += resize.amount;
+            } else {
+                new_height = (new_height - resize.amount).max(100);
+            }
+            Size::new(frame.width(), new_height)
+        }
+    };
+
+    let mut new_frame = IRect::from_center_size(frame.center(), new_size);
+
+    let (_, pad_right, _, pad_left) = config.edge_padding();
+    let display_bounds = active_display.bounds();
+
+    if new_frame.max.x > display_bounds.max.x - pad_right {
+        new_frame.min.x = display_bounds.max.x - pad_right - new_size.x;
+    }
+
+    if new_frame.min.y < display_bounds.min.y + pad_left {
+        new_frame.max.y = display_bounds.min.y + pad_left + new_size.y;
+    }
+
+    reposition_entity(entity, new_frame.min, &mut commands);
+
+    let strip = active_display.active_strip();
+    if let Some(Column::Stack(stack)) = strip
+        .index_of(entity)
+        .ok()
+        .and_then(|idx| strip.get(idx).ok())
+    {
+        let new_width = new_size.x;
+        for sibling in stack.iter().flat_map(StackItem::all_windows) {
+            if sibling != entity
+                && let Some(size) = windows.size(sibling)
+            {
+                resize_entity(sibling, size.with_x(new_width), &mut commands);
+            }
+        }
+    }
+
+    resize_entity(entity, new_size, &mut commands);
     reshuffle_around(entity, &mut commands);
 }
 
