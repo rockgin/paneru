@@ -2,7 +2,7 @@ use arc_swap::{ArcSwap, Guard};
 use bevy::ecs::resource::Resource;
 use objc2_core_foundation::{CFData, CFString};
 use regex::Regex;
-use serde::{Deserialize, Deserializer, de};
+use serde::{de, Deserialize, Deserializer};
 use std::{
     collections::HashMap,
     env,
@@ -18,8 +18,8 @@ use tracing::{error, info, warn};
 use self::decorations::BorderRadiusOption;
 use self::swipe::SwipeGestureDirection;
 use crate::{
-    commands::{Command, Direction, MouseMove, MoveFocus, Operation, ResizeDirection},
-    platform::{Modifiers, OSStatus, macos_major_version},
+    commands::{Command, Direction, MouseMove, MoveFocus, Operation, ResizeBy, ResizeDirection},
+    platform::{macos_major_version, Modifiers, OSStatus},
 };
 use crate::{
     errors::{Error, Result},
@@ -183,10 +183,19 @@ fn parse_resize_direction(direction: &str) -> Result<ResizeDirection> {
 /// `Ok(Operation)` if the arguments represent a valid operation, otherwise `Err(Error::InvalidConfig)`.
 fn parse_operation(argv: &[&str]) -> Result<Operation> {
     let empty = "";
-    let cmd = *argv.first().unwrap_or(&empty);
+    let cmd = argv.first().unwrap_or(&empty);
+    let needs_arg = matches!(
+        *cmd,
+        "focus" | "swap" | "resize" | "virtual" | "virtualmove" | "virtualsend"
+    );
+    let cmd = if needs_arg || argv.len() < 2 {
+        cmd.to_string()
+    } else {
+        argv[1..].join("_")
+    };
     let err = Error::InvalidConfig(format!("{}: Invalid command '{argv:?}'", function_name!()));
 
-    let out = match cmd {
+    let out = match cmd.as_str() {
         "focus" => Operation::Focus(parse_direction(argv.get(1).ok_or(err)?)?),
         "swap" => Operation::Swap(parse_direction(argv.get(1).ok_or(err)?)?),
         "center" => Operation::Center,
@@ -197,6 +206,10 @@ fn parse_operation(argv: &[&str]) -> Result<Operation> {
         ),
         "grow" => Operation::Resize(ResizeDirection::Grow),
         "shrink" => Operation::Resize(ResizeDirection::Shrink),
+        "growwidth" => Operation::ResizeBy(ResizeBy::grow_width()),
+        "shrinkwidth" => Operation::ResizeBy(ResizeBy::shrink_width()),
+        "growheight" => Operation::ResizeBy(ResizeBy::grow_height()),
+        "shrinkheight" => Operation::ResizeBy(ResizeBy::shrink_height()),
         "fullwidth" => Operation::FullWidth,
         "manage" => Operation::Manage,
         "equalize" => Operation::Equalize,

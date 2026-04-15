@@ -42,3 +42,11 @@ Paneru is built on Bevy and follows a strict Data-Driven Design (ECS).
 *   **Research:** Before implementing, check `src/ecs/systems.rs` to see if a similar system already exists.
 *   **Implementation:** Follow the **Plan -> Act -> Validate** cycle.
 *   **Verification:** Run `cargo fmt`, `cargo check`, and relevant tests. If the change affects layout, verify it doesn't break existing tiling behavior.
+
+## 7. Development Commands
+
+*   `cargo fmt` - Format code
+*   `cargo check` - Type check (faster than build)
+*   `cargo clippy` - Run lints (strict pedantic warnings)
+*   `cargo build` - Build the project
+*   Tests are in `src/tests.rs` and `src/tests/`

@@ -1,4 +1,4 @@
-use serde::{Deserialize, Deserializer, de};
+use serde::{de, Deserialize, Deserializer};
 
 #[derive(Deserialize, Clone, Debug, Default)]
 pub struct DecorationsOptions {
