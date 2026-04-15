@@ -1,0 +1,11 @@
+# syntax=toml
+
+[options]
+focus_follows_mouse = false
+mouse_follows_focus = false
+
+[bindings]
+window_growwidth = "alt - l"
+window_shrinkwidth = "alt - h"
+window_growheight = "alt - k"
+window_shrinkheight = "alt - j"
