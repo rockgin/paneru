@@ -68,6 +68,8 @@ pub enum Operation {
     Swap(Direction),
     /// Centers the currently focused window on the display.
     Center,
+    /// Moves the focused window to the right edge of the display with a 200px gap.
+    RightWithGap,
     /// Resizes the focused window in the given direction.
     Resize(ResizeDirection),
     /// Toggles the focused window to full width or a preset width.
@@ -122,6 +124,7 @@ pub fn register_commands(app: &mut bevy::app::App) {
             mouse_to_next_display,
             resize_window,
             command_center_window,
+            command_right_with_gap,
             full_width_window,
             to_next_display,
             equalize_column,
@@ -410,6 +413,40 @@ fn command_center_window(
             reposition_entity(entity, origin, &mut commands);
         }
 
+        window_manager.warp_mouse(active_display.bounds().center());
+    }
+}
+
+const RIGHT_GAP: i32 = 200;
+
+#[allow(clippy::needless_pass_by_value)]
+fn command_right_with_gap(
+    mut messages: MessageReader<Event>,
+    windows: Windows,
+    active_display: ActiveDisplay,
+    window_manager: Res<WindowManager>,
+    mut commands: Commands,
+) {
+    if filter_window_operations(&mut messages, |op| matches!(op, Operation::RightWithGap))
+        .next()
+        .is_none()
+    {
+        return;
+    }
+
+    if let Some((_, entity)) = windows.focused()
+        && let Some(layout_position) = windows.layout_position(entity)
+        && let Some(size) = windows.size(entity)
+        && let Some(mut origin) = windows.origin(entity)
+    {
+        let display_bounds = active_display.bounds();
+        origin.x = display_bounds.max.x - RIGHT_GAP - size.x;
+        let strip_position = origin - layout_position.0;
+        reposition_entity(
+            active_display.active_strip_entity(),
+            strip_position,
+            &mut commands,
+        );
         window_manager.warp_mouse(active_display.bounds().center());
     }
 }
