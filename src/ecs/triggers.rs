@@ -673,7 +673,7 @@ pub(super) fn window_destroyed_trigger(
     };
 
     let Some((window, entity, parent)) = windows.find_parent(window_id) else {
-        error!("Trying to destroy non-existing window {window_id}.");
+        debug!("Duplicate event: window {window_id} already destroyed.");
         return;
     };
 
