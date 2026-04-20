@@ -1,21 +1,24 @@
 use accessibility_sys::{
-    AXUIElementRef, AXValueCreate, AXValueGetValue, kAXFloatingWindowSubrole, kAXPositionAttribute,
-    kAXRaiseAction, kAXSizeAttribute, kAXStandardWindowSubrole, kAXUnknownSubrole,
-    kAXValueTypeCGPoint, kAXValueTypeCGSize, kAXWindowRole,
+    AXUIElementCreateApplication, AXUIElementRef, AXValueCreate, AXValueGetValue,
+    kAXFloatingWindowSubrole, kAXPositionAttribute, kAXRaiseAction, kAXSizeAttribute,
+    kAXStandardWindowSubrole, kAXUnknownSubrole, kAXValueTypeCGPoint, kAXValueTypeCGSize,
+    kAXWindowRole,
 };
 use bevy::ecs::component::Component;
 use bevy::math::IRect;
 use core::ptr::NonNull;
 use derive_more::{DerefMut, with_trait::Deref};
 use objc2_core_foundation::{
-    CFArray, CFNumber, CFRetained, CFString, CFType, CGPoint, CGRect, CGSize,
+    CFArray, CFBoolean, CFNumber, CFRetained, CFString, CFType, CGPoint, CGRect, CGSize,
+    kCFBooleanFalse, kCFBooleanTrue,
 };
+use std::collections::HashMap;
 use std::ptr::null_mut;
-use std::sync::OnceLock;
+use std::sync::{LazyLock, Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
 use stdext::function_name;
-use tracing::{Level, debug, instrument, trace};
+use tracing::{Level, debug, instrument, trace, warn};
 
 use super::skylight::{
     _AXUIElementGetWindow, _SLPSSetFrontProcessWithOptions, AXUIElementCopyAttributeValue,
@@ -26,6 +29,12 @@ use crate::errors::{Error, Result};
 use crate::manager::{Origin, Size, irect_from};
 use crate::platform::{Pid, ProcessSerialNumber, WinID, macos_major_version};
 use crate::util::{AXUIAttributes, AXUIWrapper, MacResult};
+
+/// Per-PID ref-count for the `AXEnhancedUserInterface` workaround. Tracks how many
+/// concurrent window operations are in-flight for each app so the attribute is only
+/// re-enabled after the last one completes (safe under `par_iter_mut`).
+static ENHANCED_UI_REFCOUNT: LazyLock<Mutex<HashMap<Pid, usize>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 #[derive(Debug)]
 pub enum WindowPadding {
@@ -38,6 +47,7 @@ pub trait WindowApi: Send + Sync {
     fn frame(&self) -> IRect;
     fn element(&self) -> Option<CFRetained<AXUIWrapper>>;
     fn title(&self) -> Result<String>;
+    fn identifier(&self) -> Result<String>;
     fn child_role(&self) -> Result<bool>;
     fn role(&self) -> Result<String>;
     fn subrole(&self) -> Result<String>;
@@ -106,6 +116,8 @@ pub struct WindowOS {
     vertical_padding: i32,
     horizontal_padding: i32,
     border_radius: OnceLock<Option<f64>>,
+    pid: OnceLock<Result<Pid>>,
+    app_reference: OnceLock<Option<CFRetained<AXUIWrapper>>>,
 }
 
 impl WindowOS {
@@ -128,6 +140,8 @@ impl WindowOS {
             vertical_padding: 0,
             horizontal_padding: 0,
             border_radius: OnceLock::new(),
+            pid: OnceLock::new(),
+            app_reference: OnceLock::new(),
         };
 
         if window.is_unknown() {
@@ -183,6 +197,80 @@ impl WindowOS {
                 && subrole.as_deref() == Some(kAXFloatingWindowSubrole))
     }
 
+    fn app_reference(&self) -> Option<CFRetained<AXUIWrapper>> {
+        self.app_reference
+            .get_or_init(|| {
+                self.pid()
+                    .map(|pid| unsafe { AXUIElementCreateApplication(pid) })
+                    .and_then(AXUIWrapper::from_retained)
+                    .inspect_err(|err| warn!("error getting app reference: {err}"))
+                    .ok()
+            })
+            .clone()
+    }
+
+    /// Disables `AXEnhancedUserInterface` on this window's app if it is currently enabled.
+    ///
+    /// Uses a per-PID ref-count so that concurrent operations on windows of the same app
+    /// (via `par_iter_mut`) keep the attribute disabled until the last caller re-enables it.
+    ///
+    /// This avoids animated move/resize that breaks window management for apps like Chrome,
+    /// Firefox, and Zen Browser when accessibility clients (e.g. Kindavim) enable enhanced UI.
+    fn disable_enhanced_ui(&self) {
+        let Ok(pid) = self.pid() else { return };
+        let mut counts = ENHANCED_UI_REFCOUNT
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(count) = counts.get_mut(&pid) {
+            *count += 1;
+            return;
+        }
+        let Some(app_element) = self.app_reference() else {
+            return;
+        };
+        let attr = CFString::from_static_str("AXEnhancedUserInterface");
+        let enabled = app_element
+            .get_attribute::<CFBoolean>(&attr)
+            .is_ok_and(|v| CFBoolean::value(&v));
+        if enabled {
+            unsafe {
+                AXUIElementSetAttributeValue(
+                    app_element.as_ptr(),
+                    attr.as_ref(),
+                    kCFBooleanFalse.unwrap(),
+                );
+            }
+            counts.insert(pid, 1);
+        }
+    }
+
+    /// Re-enables `AXEnhancedUserInterface` on this window's app once the last concurrent
+    /// caller has finished. Pairs with [`disable_enhanced_ui`].
+    fn reenable_enhanced_ui(&self) {
+        let Ok(pid) = self.pid() else { return };
+        let mut counts = ENHANCED_UI_REFCOUNT
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(count) = counts.get_mut(&pid) else {
+            return;
+        };
+        *count -= 1;
+        if *count > 0 {
+            return;
+        }
+        counts.remove(&pid);
+        if let Some(app_element) = self.app_reference() {
+            let attr = CFString::from_static_str("AXEnhancedUserInterface");
+            unsafe {
+                AXUIElementSetAttributeValue(
+                    app_element.as_ptr(),
+                    attr.as_ref(),
+                    kCFBooleanTrue.unwrap(),
+                );
+            }
+        }
+    }
+
     /// Makes the window the key window for its application by sending synthesized events.
     ///
     /// # Arguments
@@ -198,7 +286,6 @@ impl WindowOS {
         }
         let window_id = self.id();
         let mut event_bytes = [0u8; 0xf8];
-
         event_bytes[0x04] = 0xf8;
         event_bytes[0x3a] = 0x10;
         event_bytes[0x3c..0x40].copy_from_slice(&window_id.to_ne_bytes());
@@ -249,6 +336,10 @@ impl WindowApi for WindowOS {
         self.ax_element.title()
     }
 
+    fn identifier(&self) -> Result<String> {
+        self.ax_element.identifier()
+    }
+
     /// Returns true if the window has a child role.
     fn child_role(&self) -> Result<bool> {
         let role = self.role()?;
@@ -290,6 +381,7 @@ impl WindowApi for WindowOS {
             trace!("already in position.");
             return;
         }
+        self.disable_enhanced_ui();
         let mut point = CGPoint::new(
             f64::from(origin.x + self.horizontal_padding),
             f64::from(origin.y + self.vertical_padding),
@@ -312,6 +404,7 @@ impl WindowApi for WindowOS {
             self.frame.min = origin;
             self.frame.max = origin + size;
         }
+        self.reenable_enhanced_ui();
     }
 
     #[instrument(level = Level::TRACE)]
@@ -320,6 +413,7 @@ impl WindowApi for WindowOS {
             trace!("already correct size.");
             return;
         }
+        self.disable_enhanced_ui();
         let width_padding = 2 * self.horizontal_padding;
         let height_padding = 2 * self.vertical_padding;
         let mut cgsize = CGSize::new(
@@ -342,6 +436,7 @@ impl WindowApi for WindowOS {
             };
             self.frame.max = self.frame.min + size;
         }
+        self.reenable_enhanced_ui();
     }
 
     /// Updates the internal `frame` of the window by querying its current position and size from the Accessibility API.
@@ -460,15 +555,19 @@ impl WindowApi for WindowOS {
     }
 
     fn pid(&self) -> Result<Pid> {
-        let pid: Pid = unsafe {
-            NonNull::new_unchecked(self.ax_element.as_ptr::<Pid>())
-                .byte_add(0x10)
-                .read()
-        };
-        (pid != 0).then_some(pid).ok_or(Error::InvalidInput(format!(
-            "can not get pid from {:?}.",
-            self.ax_element
-        )))
+        self.pid
+            .get_or_init(|| {
+                let pid: Pid = unsafe {
+                    NonNull::new_unchecked(self.ax_element.as_ptr::<Pid>())
+                        .byte_add(0x10)
+                        .read()
+                };
+                (pid != 0).then_some(pid).ok_or(Error::InvalidInput(format!(
+                    "can not get pid from {:?}.",
+                    self.ax_element
+                )))
+            })
+            .clone()
     }
 
     fn set_padding(&mut self, padding: WindowPadding) {
