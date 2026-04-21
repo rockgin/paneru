@@ -198,6 +198,7 @@ fn parse_operation(argv: &[&str]) -> Result<Operation> {
         "fullwidth" => Operation::FullWidth,
         "manage" => Operation::Manage,
         "equalize" => Operation::Equalize,
+        "wequalize" => Operation::WEqualize,
         "stack" => Operation::Stack(true),
         "unstack" => Operation::Stack(false),
         "nextdisplay" => Operation::ToNextDisplay(MoveFocus::Follow),
