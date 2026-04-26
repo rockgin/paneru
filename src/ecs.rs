@@ -164,6 +164,9 @@ pub fn register_systems(app: &mut bevy::app::App) {
                 .chain(),
             focus::autocenter_window_on_focus.after(systems::animate_resize_entities),
             focus::mouse_follows_focus.after(systems::animate_resize_entities),
+            focus::recover_lost_focus.run_if(on_timer(Duration::from_millis(
+                REFRESH_WINDOW_CHECK_FREQ_MS,
+            ))),
         ),
     );
 }
@@ -174,6 +177,7 @@ pub fn register_triggers(app: &mut bevy::app::App) {
         .add_observer(mouse::mouse_down_trigger)
         .add_observer(mouse::mouse_up_trigger)
         .add_observer(mouse::mouse_dragged_trigger)
+        .add_observer(mouse::horizontal_warp_mouse_trigger)
         .add_observer(triggers::display_change_trigger)
         .add_observer(triggers::front_switched_trigger)
         .add_observer(triggers::window_focused_trigger)
