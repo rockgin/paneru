@@ -356,6 +356,26 @@ impl LayoutStrip {
         self.columns.swap(left, right);
     }
 
+    /// Swaps two `StackItem`s within the same `Column::Stack` identified by
+    /// the two entity IDs.  Returns `true` if a swap was performed.
+    pub fn swap_in_stack(&mut self, a: Entity, b: Entity) -> bool {
+        let Some(col_idx) = self.index_of(a).ok() else {
+            return false;
+        };
+        let Some(column) = self.columns.get_mut(col_idx) else {
+            return false;
+        };
+        if let Column::Stack(stack) = column {
+            let pos_a = stack.iter().position(|item| item.contains(a));
+            let pos_b = stack.iter().position(|item| item.contains(b));
+            if let (Some(pa), Some(pb)) = (pos_a, pos_b) {
+                stack.swap(pa, pb);
+                return true;
+            }
+        }
+        false
+    }
+
     /// Returns the number of panels in the pane.
     ///
     /// # Returns
