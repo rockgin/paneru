@@ -388,12 +388,19 @@ fn command_swap_focus(
             active_strip.len()
         );
 
-        if index < new_index {
-            (index..new_index).for_each(|idx| active_strip.swap(idx, idx + 1));
-        } else {
-            (new_index..index)
-                .rev()
-                .for_each(|idx| active_strip.swap(idx, idx + 1));
+        match index.cmp(&new_index) {
+            std::cmp::Ordering::Equal => {
+                // Both windows are in the same column (stack) — swap within the stack.
+                active_strip.swap_in_stack(current, other_window);
+            }
+            std::cmp::Ordering::Less => {
+                (index..new_index).for_each(|idx| active_strip.swap(idx, idx + 1));
+            }
+            std::cmp::Ordering::Greater => {
+                (new_index..index)
+                    .rev()
+                    .for_each(|idx| active_strip.swap(idx, idx + 1));
+            }
         }
         Some(current)
     };
