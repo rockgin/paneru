@@ -550,7 +550,7 @@ fn full_width_window(
             _ = active_display.active_strip().stack(entity);
         }
         let w = (previous_ratio * f64::from(viewport.width())).round() as i32;
-        (w, viewport.center().x - frame.width() / 2)
+        (w, viewport.center().x - w / 2)
     } else {
         let strip = active_display.active_strip();
         let was_stacked = strip
