@@ -108,7 +108,7 @@ impl NotifyHandler {
                 }
             }
 
-            KnownCGSEvent::SpaceWindowDestroyed | KnownCGSEvent::SpaceWindowCreated => {
+            KnownCGSEvent::SpaceWindowDestroyed => {
                 let offset = std::mem::size_of::<u64>();
                 if let Some(space) = from_bytes::<WorkspaceId>(data, len)
                     && let Some(window_id) = from_bytes::<WinID>(
@@ -121,7 +121,8 @@ impl NotifyHandler {
                 }
             }
 
-            KnownCGSEvent::WindowClosed
+            KnownCGSEvent::SpaceWindowCreated
+            | KnownCGSEvent::WindowClosed
             | KnownCGSEvent::WindowMoved
             | KnownCGSEvent::WindowResized
             | KnownCGSEvent::WindowReordered
