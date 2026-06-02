@@ -19,7 +19,7 @@ use tracing::{error, info, warn};
 use self::decorations::BorderRadiusOption;
 use self::swipe::SwipeGestureDirection;
 use crate::{
-    commands::{Command, Direction, MouseMove, MoveFocus, Operation, ResizeDirection},
+    commands::{Command, Direction, MouseMove, MoveFocus, Operation, ResizeBy, ResizeDirection},
     platform::{Modifiers, OSStatus, macos_major_version},
 };
 use crate::{
@@ -209,9 +209,14 @@ fn parse_operation(argv: &[&str]) -> Result<Operation> {
         ),
         "grow" => Operation::Resize(ResizeDirection::Grow),
         "shrink" => Operation::Resize(ResizeDirection::Shrink),
+        "growwidth" => Operation::ResizeBy(ResizeBy::grow_width()),
+        "shrinkwidth" => Operation::ResizeBy(ResizeBy::shrink_width()),
+        "growheight" => Operation::ResizeBy(ResizeBy::grow_height()),
+        "shrinkheight" => Operation::ResizeBy(ResizeBy::shrink_height()),
         "fullwidth" => Operation::FullWidth,
         "manage" => Operation::Manage,
         "equalize" => Operation::Equalize,
+        "wequalize" => Operation::WEqualize,
         "stack" => Operation::Stack(true),
         "unstack" => Operation::Stack(false),
         "nextdisplay" => Operation::ToNextDisplay(MoveFocus::Follow),

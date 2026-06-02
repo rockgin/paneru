@@ -7,7 +7,7 @@ use bevy::ecs::system::{Commands, Local, Populated, Res, Single};
 use bevy::math::IRect;
 use bevy::time::Time;
 use std::time::{Duration, Instant};
-use tracing::{Level, instrument};
+use tracing::{Level, instrument, trace};
 
 use crate::commands::{Command, Direction, Operation};
 use crate::config::Config;
@@ -65,6 +65,7 @@ fn swipe_gesture(
     let mut total_delta = 0.0;
     let mut touchpad_down = false;
     let mut has_scroll_event = false;
+    let mut is_wheel_input = false;
 
     // Normalization: Touchpad deltas are typically small fractions.
     // Scroll wheel deltas can be larger. We scale it down slightly
@@ -84,6 +85,7 @@ fn swipe_gesture(
             Event::Scroll { delta } => {
                 total_delta += *delta * scroll_scale;
                 has_scroll_event = true;
+                is_wheel_input = true;
             }
             Event::Swipe { deltas }
                 if config
@@ -124,18 +126,32 @@ fn swipe_gesture(
         };
 
         if let Some(scrolling) = scrolling.as_mut() {
-            // Smoothen velocity changes using EMA.
-            scrolling.velocity = 0.3 * new_velocity + 0.7 * scrolling.velocity;
-            scrolling.is_user_swiping = true;
             scrolling.last_event = Instant::now();
             scrolling.position +=
                 total_delta * viewport_width * direction_modifier * swipe_sensitivity;
+
+            if is_wheel_input {
+                // 鼠标滚轮不需要惯性滚动：velocity 清零，
+                // 避免 scrolling_integrator 在后续帧中再次叠加 position。
+                scrolling.velocity = 0.0;
+                scrolling.is_user_swiping = false;
+                trace!("wheel scroll: position updated, velocity zeroed");
+            } else {
+                // 触摸板：通过 EMA 更新 velocity，启用惯性及 snapping
+                scrolling.velocity = 0.3 * new_velocity + 0.7 * scrolling.velocity;
+                scrolling.is_user_swiping = true;
+                trace!(
+                    "touchpad scroll: velocity={:.3}, position={:.1}",
+                    scrolling.velocity,
+                    scrolling.position
+                );
+            }
         } else if let Ok(mut entity_commands) = commands.get_entity(*entity) {
             entity_commands.try_insert(Scrolling {
-                velocity: new_velocity,
+                velocity: if is_wheel_input { 0.0 } else { new_velocity },
                 position: f64::from(position.0.x)
                     + total_delta * viewport_width * direction_modifier * swipe_sensitivity,
-                is_user_swiping: touchpad_down,
+                is_user_swiping: if is_wheel_input { false } else { touchpad_down },
                 last_event: Instant::now(),
             });
         }
