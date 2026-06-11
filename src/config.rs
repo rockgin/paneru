@@ -796,6 +796,13 @@ impl Config {
             .and_then(|decorations| decorations.workspace_popup_status)
             .is_none_or(|enabled| enabled)
     }
+
+    pub fn virtual_workspace_animations(&self) -> bool {
+        // Default is disabled
+        self.options()
+            .virtual_workspace_animations
+            .is_some_and(|enabled| enabled)
+    }
 }
 
 fn parse_hex_color(hex: &str) -> (f64, f64, f64) {
@@ -1055,6 +1062,11 @@ pub struct MainOptions {
     /// never auto-merged into a tab group with an existing same-app sibling.
     /// Default: false.
     pub disable_native_tabs: Option<bool>,
+
+    /// Enable animation of virtual workspace swaps.
+    /// Off by default, because people use virtual workspaces due to the slow animation of the
+    /// native macOS workspaces.
+    pub virtual_workspace_animations: Option<bool>,
 }
 
 /// Returns a default set of column widths.

@@ -158,6 +158,7 @@ pub fn register_triggers(app: &mut bevy::app::App) {
             triggers::window_destroyed_trigger,
             triggers::refresh_configuration_trigger,
             triggers::theme_change_trigger,
+            triggers::window_resize_verifier,
         ),
     );
     app.add_observer(triggers::window_unmanaged_trigger)
@@ -256,8 +257,9 @@ pub struct WidthRatio(pub f64);
 /// so they can be navigated left-to-right in that order after the tiled strip.
 #[derive(Clone, Component, Debug)]
 pub struct NativeFullscreenMarker {
-    pub previous_strip: WorkspaceId,
-    pub previous_index: usize,
+    pub layout_strip: Entity,
+    pub workspace_id: WorkspaceId,
+    pub index: usize,
 }
 
 #[derive(Component)]
