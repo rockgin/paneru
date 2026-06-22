@@ -5,8 +5,9 @@ use bevy::MinimalPlugins;
 use bevy::app::App as BevyApp;
 use bevy::app::{PostUpdate, PreUpdate, Startup};
 use bevy::ecs::hierarchy::ChildOf;
+use bevy::ecs::lifecycle::RemovedComponents;
 use bevy::ecs::message::Messages;
-use bevy::ecs::query::With;
+use bevy::ecs::query::{Added, Changed, With};
 use bevy::ecs::resource::Resource;
 use bevy::ecs::schedule::common_conditions::{not, resource_exists};
 use bevy::ecs::system::{Commands, EntityCommands, Query, Res, SystemId};
@@ -68,6 +69,17 @@ pub fn register_systems(app: &mut bevy::app::App) {
     let dimming_enabled = |config: Option<Res<Config>>| {
         config
             .is_some_and(|config| config.has_dim_inactive_color() || config.border_active_window())
+    };
+    // The overlay must refresh not just when the active strip's layout changes,
+    // but also whenever focus moves — including focus *loss* (e.g. switching to
+    // an empty virtual workspace), which otherwise leaves a stale outline.
+    let overlay_dirty = |strip_changed: Query<
+        (),
+        (With<ActiveWorkspaceMarker>, Changed<LayoutStrip>),
+    >,
+                         focus_gained: Query<(), Added<FocusedMarker>>,
+                         mut focus_lost: RemovedComponents<FocusedMarker>| {
+        !strip_changed.is_empty() || !focus_gained.is_empty() || focus_lost.read().next().is_some()
     };
     let workspace_menu_status =
         |config: Option<Res<Config>>| config.is_some_and(|config| config.workspace_menu_status());
@@ -136,7 +148,8 @@ pub fn register_systems(app: &mut bevy::app::App) {
                 systems::update_overlays
                     .after(systems::animate_entities)
                     .after(systems::animate_resize_entities)
-                    .run_if(dimming_enabled),
+                    .run_if(dimming_enabled)
+                    .run_if(overlay_dirty),
                 systems::update_flash_messages,
             )
                 .chain(),
@@ -165,7 +178,6 @@ pub fn register_triggers(app: &mut bevy::app::App) {
         .add_observer(triggers::window_managed_trigger)
         .add_observer(triggers::window_minimized_trigger)
         .add_observer(triggers::spawn_window_trigger)
-        .add_observer(triggers::locate_dock_trigger)
         .add_observer(triggers::send_message_trigger)
         .add_observer(triggers::window_removal_trigger)
         .add_observer(triggers::cleanup_timeout_trigger)
@@ -424,7 +436,7 @@ pub struct Initializing;
 pub struct SpawnWindowTrigger(pub Vec<Window>);
 
 #[derive(BevyEvent)]
-pub struct LocateDockTrigger(pub Entity);
+pub struct ReadDisplayProperties(pub Entity);
 
 #[derive(BevyEvent)]
 pub struct SendMessageTrigger(pub Event);
@@ -512,12 +524,13 @@ impl SpawnCommandsExt for Commands<'_, '_> {
         let mut spawned = self.spawn((
             layout_strip,
             Position(origin),
-            SelectedVirtualMarker,
             FloatingLayer::default(),
             ChildOf(display_entity),
         ));
         if active {
             spawned.insert(ActiveWorkspaceMarker);
+        } else {
+            spawned.insert(SelectedVirtualMarker);
         }
         spawned
     }
