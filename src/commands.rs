@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use bevy::app::PreUpdate;
 use bevy::ecs::entity::{Entity, EntityHashSet};
 use bevy::ecs::hierarchy::ChildOf;
@@ -6,7 +8,7 @@ use bevy::ecs::query::{Has, With, Without};
 use bevy::ecs::system::{Commands, Query, Res, Single};
 use bevy::math::IRect;
 use tracing::{Level, instrument};
-use tracing::{debug, info};
+use tracing::{debug, error, info};
 
 mod query;
 
@@ -16,8 +18,9 @@ use crate::ecs::focus::FocusHistory;
 use crate::ecs::layout::{Column, LayoutStrip, StackItem};
 use crate::ecs::params::{ActiveDisplay, ActiveDisplayMut, Windows};
 use crate::ecs::{
-    ActiveDisplayMarker, ActiveWorkspaceMarker, FocusedMarker, FullWidthMarker,
-    NativeFullscreenMarker, SelectedVirtualMarker, SendMessageTrigger, SpawnCommandsExt, Unmanaged,
+    ActiveDisplayMarker, ActiveWorkspaceMarker, Bounds, DockPosition, FocusedMarker,
+    FullWidthMarker, NativeFullscreenMarker, SelectedVirtualMarker, SendMessageTrigger,
+    SpawnCommandsExt, Timeout, Unmanaged,
 };
 use crate::events::Event;
 use crate::manager::{Application, Display, Origin, Size, Window, WindowManager, origin_from};
@@ -131,9 +134,8 @@ pub enum Operation {
     ToNextDisplay(MoveFocus),
     /// Distributes heights equally among windows in the focused stack.
     Equalize,
-    /// Equalizes width between the focused window and the window to its left, taking up full width.
-    /// If there is no window A, makes B take half the screen width and perfectly center on the screen.
-    WEqualize,
+    /// Makes all columns in the active strip the same width as the focused window.
+    Balance,
     /// Toggles the managed state of the focused window.
     Manage,
     /// Stacks or unstacks a window. The boolean indicates whether to stack (`true`) or unstack (`false`).
@@ -178,6 +180,8 @@ pub enum Command {
     Mouse(MouseMove),
     /// A command to quit the window manager application.
     Quit,
+    /// A command to restart the window manager service.
+    Restart,
     PrintState,
 }
 
@@ -187,16 +191,15 @@ pub fn register_commands(app: &mut bevy::app::App) {
         PreUpdate,
         (
             command_quit_handler,
+            command_restart_handler,
             print_internal_state_handler,
             mouse_to_next_display,
             resize_window,
-            resize_by_pixels,
             command_center_window,
-            command_right_with_gap,
             full_width_window,
             to_next_display,
             equalize_column,
-            wequalize_windows,
+            balance_strip,
             manage_window,
             stack_windows_handler,
             command_move_focus,
@@ -207,6 +210,10 @@ pub fn register_commands(app: &mut bevy::app::App) {
             command_swap_focus,
             snap_window,
         ),
+    );
+    app.add_systems(
+        PreUpdate,
+        (resize_by_pixels, command_right_with_gap),
     );
 }
 
@@ -1028,7 +1035,9 @@ fn full_width_window(
     let viewport = active_display.actual_bounds(&config);
 
     if let Some(marker) = windows.full_width(entity) {
-        commands.entity(entity).try_remove::<FullWidthMarker>();
+        if let Ok(mut entity_commands) = commands.get_entity(entity) {
+            entity_commands.try_remove::<FullWidthMarker>();
+        }
         let w = (marker.width_ratio * f64::from(viewport.width())).round() as i32;
         let bounds = active_display.actual_bounds(&config).size().with_x(w);
         commands.resize_entity(entity, bounds);
@@ -1043,9 +1052,9 @@ fn full_width_window(
             _ = strip.unstack(entity);
         }
         let width_ratio = windows.width_ratio(entity).unwrap_or(0.5);
-        commands
-            .entity(entity)
-            .try_insert(FullWidthMarker { width_ratio });
+        if let Ok(mut entity_commands) = commands.get_entity(entity) {
+            entity_commands.try_insert(FullWidthMarker { width_ratio });
+        }
         commands.reposition_entity(entity, Origin::new(viewport.min.x, viewport.min.y));
         commands.resize_entity(entity, Size::new(viewport.width(), viewport.height()));
         commands.reshuffle_around(entity);
@@ -1121,13 +1130,13 @@ fn manage_window(
 /// * `windows` - A mutable query for `Window` components, their `Entity`, and whether they have the `Unmanaged` marker.
 /// * `active_display` - A mutable reference to the `ActiveDisplayMut` resource.
 /// * `commands` - Bevy commands to modify entities and trigger events.
-#[allow(clippy::needless_pass_by_value)]
+#[allow(clippy::needless_pass_by_value, clippy::type_complexity)]
 fn to_next_display(
     mut messages: MessageReader<Event>,
     windows: Windows,
     mut active_display: ActiveDisplayMut,
     mut other_workspaces: Query<
-        &mut LayoutStrip,
+        (&mut LayoutStrip, &ChildOf),
         (With<SelectedVirtualMarker>, Without<ActiveWorkspaceMarker>),
     >,
     window_manager: Res<WindowManager>,
@@ -1194,12 +1203,33 @@ fn to_next_display(
 
     // Insert into the target display's selected strip.
     if let Ok(target_space_id) = window_manager.active_display_space(target_display_id)
-        && let Some(mut target_strip) = other_workspaces
+        && let Some((mut target_strip, child)) = other_workspaces
             .iter_mut()
-            .find(|strip| strip.id() == target_space_id)
+            .find(|(strip, _)| strip.id() == target_space_id)
     {
         target_strip.append(entity);
         commands.reshuffle_around(entity);
+
+        // Add a delayed refresh of the window size - because the otehr display can have different bounds.
+        let display_entity = child.parent();
+        let moved_window = entity;
+        let refresh_size = move |windows: Query<&Bounds, With<Window>>,
+                                 displays: Query<(&Display, Option<&DockPosition>)>,
+                                 mut commands: Commands,
+                                 config: Res<Config>| {
+            let viewport = displays
+                .get(display_entity)
+                .ok()
+                .map(|(display, dock)| display.actual_display_bounds(dock, &config));
+            if let Some(viewport_bounds) = viewport
+                && let Ok(Bounds(bounds)) = windows.get(moved_window)
+            {
+                debug!("Refreshing size of window {entity}");
+                commands.resize_entity(moved_window, bounds.with_y(viewport_bounds.height()));
+            }
+        };
+        let system_id = commands.register_system(refresh_size);
+        Timeout::callback(Duration::from_secs(1), system_id, &mut commands);
     }
 }
 
@@ -1309,70 +1339,49 @@ fn equalize_column(
     }
 }
 
-/// If there is a window A to the left of the focused window B, makes A and B take up the full
-/// padded screen width and splits it equally between them.
-/// If there is no window A, makes B take half the screen width and perfectly center on the screen.
+/// Makes all columns in the active strip the same width as the focused window.
 #[allow(clippy::needless_pass_by_value)]
-fn wequalize_windows(
+fn balance_strip(
     mut messages: MessageReader<Event>,
     windows: Windows,
     active_display: ActiveDisplay,
-    config: Res<Config>,
     mut commands: Commands,
 ) {
-    if filter_window_operations(&mut messages, |op| matches!(op, Operation::WEqualize))
+    if filter_window_operations(&mut messages, |op| matches!(op, Operation::Balance))
         .next()
         .is_none()
     {
         return;
     }
 
-    let Some((_, entity_b)) = windows.focused() else {
+    let Some((_, focused_entity)) = windows.focused() else {
+        return;
+    };
+    let Some(focused_width) = windows.size(focused_entity).map(|s| s.x) else {
         return;
     };
 
-    let active_strip = active_display.active_strip();
-    let display_bounds = active_display.bounds();
-    let (_, pad_right, _, pad_left) = config.edge_padding();
+    let strip = active_display.active_strip();
 
-    let padded_width = display_bounds.width() - pad_left - pad_right;
-    let min_x = display_bounds.min.x + pad_left;
-    let half_width = padded_width / 2;
+    for column in strip.columns() {
+        if matches!(column, Column::Fullscren(_)) {
+            continue;
+        }
 
-    let resize_column = |entity: Entity, width: i32, commands: &mut Commands| {
-        if let Ok(column) = active_strip.index_of(entity).and_then(|idx| active_strip.get(idx)) {
-            let column_windows = match column {
-                Column::Single(e) | Column::Fullscren(e) => vec![e],
-                Column::Stack(items) => items.iter().flat_map(StackItem::window_iter).collect(),
-                Column::Tabs(tabs) => tabs.clone(),
-            };
-            for win in column_windows {
-                if let Some(size) = windows.size(win) {
-                    commands.resize_entity(win, size.with_x(width));
-                }
+        for entity in column.window_iter() {
+            if windows.full_width(entity).is_some()
+                && let Ok(mut cmds) = commands.get_entity(entity)
+            {
+                cmds.try_remove::<FullWidthMarker>();
             }
-        }
-    };
 
-    if let Some(entity_a) = get_window_in_direction(&Direction::West, entity_b, active_strip) {
-        resize_column(entity_a, half_width, &mut commands);
-        resize_column(entity_b, half_width, &mut commands);
-
-        if let Some(origin_a) = windows.origin(entity_a) {
-            commands.reposition_entity(entity_a, Origin::new(min_x, origin_a.y));
-        }
-        if let Some(origin_b) = windows.origin(entity_b) {
-            commands.reposition_entity(entity_b, Origin::new(min_x + half_width, origin_b.y));
-        }
-    } else {
-        resize_column(entity_b, half_width, &mut commands);
-        let center_x = display_bounds.min.x + pad_left + (padded_width - half_width) / 2;
-        if let Some(origin_b) = windows.origin(entity_b) {
-            commands.reposition_entity(entity_b, Origin::new(center_x, origin_b.y));
+            if let Some(size) = windows.size(entity) {
+                commands.resize_entity(entity, size.with_x(focused_width));
+            }
         }
     }
 
-    commands.reshuffle_around(entity_b);
+    commands.reshuffle_around(focused_entity);
 }
 
 /// Slides the strip so the focused window is fully visible, snapping to the
@@ -1438,8 +1447,10 @@ pub fn stack_windows_handler(
         .and_then(|(_, entity)| windows.get_managed(entity))
         && unmanaged.is_none()
     {
-        if windows.full_width(entity).is_some() {
-            commands.entity(entity).try_remove::<FullWidthMarker>();
+        if windows.full_width(entity).is_some()
+            && let Ok(mut entity_commands) = commands.get_entity(entity)
+        {
+            entity_commands.try_remove::<FullWidthMarker>();
         }
         let strip = active_display.active_strip();
         if *stack {
@@ -1476,6 +1487,22 @@ pub fn command_quit_handler(
         )
     }) {
         _ = window_manager.quit();
+    }
+}
+
+#[instrument(level = Level::DEBUG, skip_all)]
+#[allow(clippy::needless_pass_by_value)]
+pub fn command_restart_handler(mut messages: MessageReader<Event>) {
+    if messages.read().any(|event| {
+        matches!(
+            event,
+            Event::Command {
+                command: Command::Restart
+            }
+        )
+    }) && let Err(err) = crate::platform::service::Service::request_restart()
+    {
+        error!("failed to restart service: {err}");
     }
 }
 

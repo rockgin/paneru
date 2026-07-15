@@ -5,7 +5,7 @@ use bevy::ecs::hierarchy::{ChildOf, Children};
 use bevy::ecs::message::{MessageReader, MessageWriter};
 use bevy::ecs::query::{Added, Changed, Has, Or, With, Without};
 use bevy::ecs::system::{
-    Commands, Local, NonSend, NonSendMut, ParallelCommands, Populated, Query, Res, ResMut, Single,
+    Commands, Local, NonSend, NonSendMut, Populated, Query, Res, ResMut, Single,
 };
 use bevy::math::IRect;
 use bevy::tasks::AsyncComputeTaskPool;
@@ -101,7 +101,9 @@ pub(crate) fn add_existing_process(
             return;
         };
         commands.spawn((app, ExistingMarker, ChildOf(entity)));
-        commands.entity(entity).try_remove::<ExistingMarker>();
+        if let Ok(mut entity_commands) = commands.get_entity(entity) {
+            entity_commands.try_remove::<ExistingMarker>();
+        }
     }
 }
 
@@ -121,6 +123,7 @@ pub(crate) fn add_existing_application(
     window_manager: Res<WindowManager>,
     workspaces: Query<&LayoutStrip>,
     fresh_apps: Populated<(&mut Application, Entity), With<ExistingMarker>>,
+    config: Res<Config>,
     mut commands: Commands,
 ) {
     let spaces = workspaces
@@ -134,18 +137,23 @@ pub(crate) fn add_existing_application(
 
         if app.observe().is_ok_and(|result| result)
             && let Ok((found_windows, offscreen)) = window_manager
-                .find_existing_application_windows(&mut app, &spaces)
+                .find_existing_application_windows(&mut app, &spaces, &config)
                 .inspect_err(|err| warn!("{err}"))
         {
             offscreen_windows.extend(offscreen);
             commands.trigger(SpawnWindowTrigger(found_windows));
         }
-        commands.entity(entity).try_remove::<ExistingMarker>();
+        if let Ok(mut entity_commands) = commands.get_entity(entity) {
+            entity_commands.try_remove::<ExistingMarker>();
+        }
 
         if !offscreen_windows.is_empty() {
             let pid = app.pid();
-            let bruteforce_task =
-                thread_pool.spawn(async move { bruteforce_windows(pid, offscreen_windows) });
+            let bundle_id = app.bundle_id();
+            let config = config.clone();
+            let bruteforce_task = thread_pool.spawn(async move {
+                bruteforce_windows(pid, bundle_id.as_deref(), offscreen_windows, &config)
+            });
             commands.spawn(BruteforceWindows(bruteforce_task));
         }
     }
@@ -181,7 +189,9 @@ pub(crate) fn finish_setup(
         for (entity, mut job) in &mut bruteforce_tasks {
             if let Some(found_windows) = future::block_on(future::poll_once(&mut job.0)) {
                 commands.trigger(SpawnWindowTrigger(found_windows));
-                commands.entity(entity).despawn();
+                if let Ok(mut entity_commands) = commands.get_entity(entity) {
+                    entity_commands.try_despawn();
+                }
             }
         }
         // Wait for the next tick to finish initialization.
@@ -207,7 +217,9 @@ pub(crate) fn finish_setup(
                     .filter_map(|window_id| windows.find_managed(window_id))
                     .filter(|(window, entity)| {
                         if window.is_minimized() {
-                            commands.entity(*entity).try_insert(Unmanaged::Minimized);
+                            if let Ok(mut entity_commands) = commands.get_entity(*entity) {
+                                entity_commands.try_insert(Unmanaged::Minimized);
+                            }
                             false
                         } else {
                             true
@@ -256,6 +268,7 @@ pub(crate) fn finish_setup(
 pub(super) fn add_launched_process(
     window_manager: Res<WindowManager>,
     fresh_processes: Populated<(Entity, &mut BProcess, Has<Children>), With<FreshMarker>>,
+    config: Res<Config>,
     mut commands: Commands,
 ) {
     const APP_OBSERVABLE_TIMEOUT_SEC: u64 = 5;
@@ -268,13 +281,23 @@ pub(super) fn add_launched_process(
             continue;
         }
 
+        if config.should_force_manage_process(process) {
+            debug!(
+                "Forcing management of launched process '{}' despite unobservable policy.",
+                process.name()
+            );
+            process.force_manage(true);
+        }
+
         if !process.ready() {
             continue;
         }
 
         if children {
             // Process already has an attached Application, so finish.
-            commands.entity(entity).try_remove::<FreshMarker>();
+            if let Ok(mut entity_commands) = commands.get_entity(entity) {
+                entity_commands.try_remove::<FreshMarker>();
+            }
             continue;
         }
 
@@ -312,18 +335,21 @@ pub(super) fn add_launched_process(
 pub(super) fn add_launched_application(
     app_query: Populated<(&mut Application, Entity, Has<Children>), With<FreshMarker>>,
     windows: Windows,
+    config: Res<Config>,
     mut commands: Commands,
 ) {
     // TODO: maybe refactor this with add_existing_application_windows()
     let find_window = |window_id| windows.find(window_id);
 
     for (app, entity, has_children) in app_query {
-        let mut create_windows = app.window_list();
+        let mut create_windows = app.window_list(&config);
         // Retain the non-existing windows, so they can be created.
         create_windows.retain(|window| find_window(window.id()).is_none());
 
         if !create_windows.is_empty() {
-            commands.entity(entity).try_remove::<FreshMarker>();
+            if let Ok(mut entity_commands) = commands.get_entity(entity) {
+                entity_commands.try_remove::<FreshMarker>();
+            }
             debug!(
                 "spawn! (polling path found {} new windows for {entity})",
                 create_windows.len(),
@@ -333,7 +359,9 @@ pub(super) fn add_launched_application(
             // Windows were already created via AXCreated notification path.
             // Remove FreshMarker so the Timeout gets cleaned up.
             debug!("removing FreshMarker from {entity}: windows already created via AXCreated");
-            commands.entity(entity).try_remove::<FreshMarker>();
+            if let Ok(mut entity_commands) = commands.get_entity(entity) {
+                entity_commands.try_remove::<FreshMarker>();
+            }
         }
     }
 }
@@ -357,9 +385,9 @@ pub(super) fn fresh_marker_cleanup(
     mut commands: Commands,
 ) {
     for (entity, fresh, _) in cleanup {
-        if !fresh {
+        if !fresh && let Ok(mut entity_commands) = commands.get_entity(entity) {
             // Process was ready before the timer finished.
-            commands.entity(entity).try_remove::<Timeout>();
+            entity_commands.try_remove::<Timeout>();
         }
     }
 }
@@ -386,7 +414,9 @@ pub(super) fn timeout_ticker(
                 commands.unregister_system(system_id);
             }
             trace!("Removing timer {entity}");
-            commands.entity(entity).despawn();
+            if let Ok(mut entity_commands) = commands.get_entity(entity) {
+                entity_commands.try_despawn();
+            }
         } else {
             timeout.timer.tick(clock.delta());
         }
@@ -449,7 +479,7 @@ pub(super) fn animate_entities(
     animate: Populated<(&mut Position, Entity, &RepositionMarker)>,
     time: Res<Time>,
     config: Res<Config>,
-    commands: ParallelCommands,
+    mut commands: Commands,
 ) {
     // Frame-rate-independent exponential smoothing (ease-out).
     // `animation_speed` is the decay rate (per second); higher = snappier.
@@ -478,10 +508,8 @@ pub(super) fn animate_entities(
                 position.0,
             );
             position.0 = new_pos;
-            if finished {
-                commands.command_scope(|mut command| {
-                    command.entity(entity).try_remove::<RepositionMarker>();
-                });
+            if finished && let Ok(mut entity_commands) = commands.get_entity(entity) {
+                entity_commands.try_remove::<RepositionMarker>();
             }
         });
 }
@@ -502,7 +530,7 @@ pub(super) fn animate_resize_entities(
     animate: Populated<(&mut Bounds, Entity, &ResizeMarker)>,
     time: Res<Time>,
     config: Res<Config>,
-    commands: ParallelCommands,
+    mut commands: Commands,
 ) {
     // Matches animate_entities: exponential ease-out, frame-rate independent.
     let rate = config.animation_speed();
@@ -527,10 +555,8 @@ pub(super) fn animate_resize_entities(
                 bounds.0,
             );
             bounds.0 = new_size;
-            if finished {
-                commands.command_scope(|mut command| {
-                    command.entity(entity).try_remove::<ResizeMarker>();
-                });
+            if finished && let Ok(mut entity_commands) = commands.get_entity(entity) {
+                entity_commands.try_remove::<ResizeMarker>();
             }
         });
 }
@@ -737,13 +763,21 @@ pub(crate) fn gather_initial_processes(
             event => warn!("Stray event during initial process gathering: {event:?}"),
         }
     }
-    if let Some(config) = initial_config {
-        commands.insert_resource(config);
-    }
-
     while let Some(mut process) = initial_processes.pop() {
-        if process.is_observable() {
-            debug!("Adding existing process {}", process.name());
+        let forced = initial_config
+            .as_ref()
+            .is_some_and(|c| c.should_force_manage_process(&**process));
+
+        if process.is_observable() || forced {
+            if forced {
+                debug!(
+                    "Forcing management of existing process '{}' despite unobservable policy.",
+                    process.name()
+                );
+                process.force_manage(true);
+            } else {
+                debug!("Adding existing process {}", process.name());
+            }
             commands.spawn((ExistingMarker, process));
         } else {
             debug!(
@@ -751,6 +785,10 @@ pub(crate) fn gather_initial_processes(
                 process.name(),
             );
         }
+    }
+
+    if let Some(config) = initial_config {
+        commands.insert_resource(config);
     }
 }
 
@@ -891,13 +929,17 @@ pub(super) fn verify_window_position(
             .update_frame()
             .is_ok_and(|frame| frame.min == position.0)
         {
-            commands.entity(entity).try_remove::<VerifyWindowPosition>();
+            if let Ok(mut entity_commands) = commands.get_entity(entity) {
+                entity_commands.try_remove::<VerifyWindowPosition>();
+            }
             continue;
         }
 
         window.reposition(position.0);
-        if verification.tick() {
-            commands.entity(entity).try_remove::<VerifyWindowPosition>();
+        if verification.tick()
+            && let Ok(mut entity_commands) = commands.get_entity(entity)
+        {
+            entity_commands.try_remove::<VerifyWindowPosition>();
         }
     }
 }
@@ -1030,7 +1072,9 @@ pub(crate) fn update_flash_messages(
     }
 
     for entity in stale {
-        commands.entity(entity).despawn();
+        if let Ok(mut entity_commands) = commands.get_entity(entity) {
+            entity_commands.try_despawn();
+        }
     }
 
     if let Some((_, flash, timeout)) = alive {
