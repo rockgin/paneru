@@ -151,7 +151,7 @@ fn test_scrolling() {
             command: Command::PrintState,
         },
         Event::Swipe {
-            delta: 0.3,
+            delta: 0.4,
             fingers: 3,
         },
         Event::Command {
@@ -177,9 +177,9 @@ fn test_scrolling() {
             assert_window_at!(world, 2, 800, TEST_MENUBAR_HEIGHT);
         })
         .on_iteration(5, move |world, _state| {
-            assert_window_at!(world, 0, -315, TEST_MENUBAR_HEIGHT);
-            assert_window_at!(world, 1, 85, TEST_MENUBAR_HEIGHT);
-            assert_window_at!(world, 2, 485, TEST_MENUBAR_HEIGHT);
+            assert_window_at!(world, 0, -395, TEST_MENUBAR_HEIGHT);
+            assert_window_at!(world, 1, -24, TEST_MENUBAR_HEIGHT);
+            assert_window_at!(world, 2, 376, TEST_MENUBAR_HEIGHT);
         })
         .run(commands);
 }
@@ -1280,5 +1280,328 @@ fn test_virtual_workspace_switch_stops_in_flight_strip_animation() {
     assert_eq!(
         final_x, saved_x,
         "strip x drifted after restore: was {saved_x}, now {final_x}"
+    );
+}
+
+/// With `auto_center` off, a reshuffle around the leftmost window of a
+/// scrollable strip must pin the strip to the left edge — the leftmost
+/// window's left edge must touch the display's left edge, never leaving empty
+/// space to its left.
+///
+/// Regression: after a virtual-workspace switch parks the inactive strip at
+/// `bounds.max - 10`, every window's on-screen frame is momentarily stale at
+/// the right-edge sliver. A focus-driven `reshuffle_layout_strip` that read
+/// that stale frame computed a large positive strip offset and pushed column 0
+/// away from the left edge (leftmost window ended up right-aligned). This test
+/// injects the stale right-edge frame directly (the real trigger is a delayed
+/// duplicate OS focus event that the mock platform doesn't emit) and asserts
+/// the reshuffle clamps the strip back to the left edge.
+#[test]
+fn test_reshuffle_leftmost_pins_strip_to_left_edge_with_stale_frame() {
+    use crate::ecs::{Position, ReshuffleAroundMarker};
+
+    let config: Config = (
+        MainOptions {
+            auto_center: Some(false),
+            animation_speed: Some(30.0),
+            ..Default::default()
+        },
+        vec![],
+    )
+        .into();
+
+    // 5 windows @ 400px = 2000px strip on a 1024px display → scrollable.
+    let mut h = TestHarness::new().with_config(config).with_windows(5);
+
+    let pump = |h: &mut TestHarness, c: Command| {
+        h.app
+            .world_mut()
+            .write_message::<Event>(Event::Command { command: c });
+        for _ in 0..10 {
+            h.app.update();
+            for e in h.mock_state.drain_events() {
+                h.app.world_mut().write_message::<Event>(e);
+            }
+        }
+    };
+
+    // Boot the strip; column 0 (window id 0) sits at layout x 0.
+    pump(&mut h, Command::PrintState);
+
+    let leftmost = find_window_entity(0, h.app.world_mut());
+
+    // Simulate the stale post-VW-switch state: the leftmost window's on-screen
+    // frame is parked at the right-edge sliver while its layout position is
+    // still 0. Clear any in-flight animation so moving_frame reads the origin.
+    {
+        let world = h.app.world_mut();
+        if let Ok(mut e) = world.get_entity_mut(leftmost) {
+            e.insert(Position(Origin::new(
+                TEST_DISPLAY_WIDTH - 5,
+                TEST_MENUBAR_HEIGHT,
+            )));
+            e.remove::<RepositionMarker>();
+            // Trigger a reshuffle around the leftmost window, as focus would.
+            e.insert(ReshuffleAroundMarker);
+        }
+    }
+
+    for _ in 0..15 {
+        h.app.update();
+        for e in h.mock_state.drain_events() {
+            h.app.world_mut().write_message::<Event>(e);
+        }
+    }
+
+    // The strip must be pinned to the left edge (offset 0): column 0 has
+    // layout x 0, so its on-screen left edge lands at the display's left edge.
+    let world = h.app.world_mut();
+    let mut q = world.query_filtered::<&Position, With<ActiveWorkspaceMarker>>();
+    let strip_x = q.single(world).expect("exactly one active strip").0.x;
+    assert_eq!(
+        strip_x, 0,
+        "reshuffle around leftmost window must pin strip to left edge (offset 0), got {strip_x}"
+    );
+}
+
+/// With `virtual_workspace_animations = true`, switching away from a scrolled
+/// strip and back must restore its saved scroll position, not reset it.
+///
+/// Regression: the animated restore branch of `show_active_workspace` called
+/// `reshuffle_around(focus)` in addition to animating the strip to its saved
+/// origin. That reshuffle read stale mid-animation window frames a frame later
+/// and overwrote the restore target with a different offset, discarding the
+/// saved scroll (the strip jumped back to 0). The animated branch now restores
+/// the origin without reshuffling, mirroring the non-animated branch.
+#[test]
+fn test_virtual_workspace_switch_preserves_scroll_with_animations() {
+    use crate::ecs::Position;
+
+    let config: Config = (
+        MainOptions {
+            auto_center: Some(false),
+            animation_speed: Some(30.0),
+            swipe_gesture_fingers: Some(3),
+            virtual_workspace_animations: Some(true),
+            ..Default::default()
+        },
+        vec![],
+    )
+        .into();
+
+    // 5 windows @ 400px = 2000px strip on a 1024px display → scrollable.
+    let mut h = TestHarness::new().with_config(config).with_windows(5);
+
+    let pump_event = |h: &mut TestHarness, ev: Event| {
+        h.app.world_mut().write_message::<Event>(ev);
+        for _ in 0..14 {
+            h.app.update();
+            for e in h.mock_state.drain_events() {
+                h.app.world_mut().write_message::<Event>(e);
+            }
+        }
+    };
+    let pump = |h: &mut TestHarness, c: Command| pump_event(h, Event::Command { command: c });
+
+    // Boot and scroll the strip off the left edge to a non-zero offset.
+    pump(&mut h, Command::PrintState);
+    pump_event(
+        &mut h,
+        Event::Swipe {
+            delta: 0.4,
+            fingers: 3,
+        },
+    );
+
+    let strip_x_after_scroll = {
+        let world = h.app.world_mut();
+        let mut q = world.query_filtered::<&Position, With<ActiveWorkspaceMarker>>();
+        q.single(world).expect("active strip after scroll").0.x
+    };
+    assert_ne!(
+        strip_x_after_scroll, 0,
+        "test setup: strip should be scrolled off the left edge, got 0"
+    );
+
+    // Switch to an empty VW and back.
+    pump(&mut h, Command::Window(Operation::VirtualNumber(1)));
+    pump(&mut h, Command::Window(Operation::VirtualNumber(0)));
+
+    let strip_x_restored = {
+        let world = h.app.world_mut();
+        let mut q = world.query_filtered::<&Position, With<ActiveWorkspaceMarker>>();
+        q.single(world).expect("active strip after restore").0.x
+    };
+    assert_eq!(
+        strip_x_restored, strip_x_after_scroll,
+        "animated VW restore must preserve the saved scroll position. \
+         Expected {strip_x_after_scroll}, got {strip_x_restored}"
+    );
+}
+
+/// With `virtual_workspace_animations = true`, switching to another virtual
+/// workspace must move the previously-active strip (and therefore its windows)
+/// off-screen. Regression: `show_active_workspace` queued a `RepositionMarker`
+/// to animate the old strip to `bounds.max - 10`, but a cleanup block right
+/// after removed the very same marker in the same command flush — so the strip
+/// never moved and all of the old workspace's windows stayed visible on top of
+/// the workspace we switched to. The cleanup now runs before the hide
+/// reposition is queued.
+#[test]
+fn test_virtual_workspace_switch_hides_old_strip_with_animations() {
+    use crate::ecs::{Position, layout::LayoutStrip};
+
+    let config: Config = (
+        MainOptions {
+            auto_center: Some(false),
+            animation_speed: Some(30.0),
+            swipe_gesture_fingers: Some(3),
+            virtual_workspace_animations: Some(true),
+            ..Default::default()
+        },
+        vec![],
+    )
+        .into();
+
+    let mut h = TestHarness::new().with_config(config).with_windows(5);
+
+    let pump = |h: &mut TestHarness, c: Command| {
+        h.app
+            .world_mut()
+            .write_message::<Event>(Event::Command { command: c });
+        for _ in 0..14 {
+            h.app.update();
+            for e in h.mock_state.drain_events() {
+                h.app.world_mut().write_message::<Event>(e);
+            }
+        }
+    };
+
+    pump(&mut h, Command::PrintState);
+    // Leave a window on VW0 (Stay) and spawn VW1 with one window, then switch.
+    pump(
+        &mut h,
+        Command::Window(Operation::VirtualMoveNumber(1, MoveFocus::Stay)),
+    );
+    pump(&mut h, Command::Window(Operation::VirtualNumber(1)));
+
+    // The inactive VW0 strip must have moved off-screen (its origin parked at
+    // bounds.max - 10 = 1014), taking its windows with it.
+    let world = h.app.world_mut();
+    let mut q = world.query::<(&LayoutStrip, &Position, Has<ActiveWorkspaceMarker>)>();
+    let inactive_x = q
+        .iter(world)
+        .find_map(|(_, pos, active)| (!active).then_some(pos.0.x))
+        .expect("an inactive strip exists after switching workspaces");
+    assert!(
+        inactive_x >= TEST_DISPLAY_WIDTH - 10,
+        "inactive strip must be parked off-screen (>= {}), got {inactive_x}",
+        TEST_DISPLAY_WIDTH - 10
+    );
+}
+
+/// Stacking or unstacking the focused window must bring it fully back into
+/// view. Regression: stack_windows_handler mutated the strip but never
+/// reshuffled, so when the strip was scrolled such that the focused window's
+/// new column slot fell off-screen, the window stayed partially or fully
+/// invisible even though it kept focus. It now reshuffles around the focused
+/// window; the edge-clamp in reshuffle_layout_strip keeps the strip pinned to
+/// the edges.
+#[test]
+fn test_stack_unstack_brings_focused_window_into_view() {
+    use crate::ecs::{Bounds, Position, Scrolling};
+
+    let config: Config = (
+        MainOptions {
+            auto_center: Some(false),
+            animation_speed: Some(10000.0),
+            swipe_gesture_fingers: Some(3),
+            ..Default::default()
+        },
+        vec![],
+    )
+        .into();
+
+    // 5 windows @ 400px = 2000px strip on a 1024px display → scrollable.
+    let mut h = TestHarness::new().with_config(config).with_windows(5);
+
+    let pump = |h: &mut TestHarness, c: Command| {
+        h.app
+            .world_mut()
+            .write_message::<Event>(Event::Command { command: c });
+        for _ in 0..16 {
+            h.app.update();
+            for e in h.mock_state.drain_events() {
+                h.app.world_mut().write_message::<Event>(e);
+            }
+        }
+    };
+
+    // Emulate the real-app settled state after a swipe: the strip is scrolled
+    // and the transient Scrolling has been removed (swiping_timeout drops it
+    // within ~50ms in the app; the test harness's fast wall-clock wouldn't).
+    let settle_scroll_offset = |h: &mut TestHarness| {
+        h.app.world_mut().write_message::<Event>(Event::Swipe {
+            delta: 0.9,
+            fingers: 3,
+        });
+        for _ in 0..16 {
+            h.app.update();
+            for e in h.mock_state.drain_events() {
+                h.app.world_mut().write_message::<Event>(e);
+            }
+        }
+        let world = h.app.world_mut();
+        let mut q = world.query_filtered::<Entity, With<Scrolling>>();
+        for e in q.iter(world).collect::<Vec<_>>() {
+            if let Ok(mut em) = world.get_entity_mut(e) {
+                em.remove::<Scrolling>();
+            }
+        }
+        for _ in 0..4 {
+            h.app.update();
+            for e in h.mock_state.drain_events() {
+                h.app.world_mut().write_message::<Event>(e);
+            }
+        }
+    };
+
+    let is_fully_onscreen = |h: &mut TestHarness, id: i32| {
+        let e = find_window_entity(id, h.app.world_mut());
+        let world = h.app.world();
+        let p = world.get::<Position>(e).unwrap().0;
+        let b = world.get::<Bounds>(e).unwrap().0;
+        p.x >= 0 && p.x + b.x <= TEST_DISPLAY_WIDTH
+    };
+
+    pump(&mut h, Command::PrintState);
+
+    // Focus window 1, scroll it off the left edge, then stack it onto window 0.
+    pump(&mut h, Command::Window(Operation::Focus(Direction::First)));
+    pump(&mut h, Command::Window(Operation::Focus(Direction::East)));
+    settle_scroll_offset(&mut h);
+    assert!(
+        !is_fully_onscreen(&mut h, 1),
+        "test setup: focused window should be off-screen before stacking"
+    );
+
+    pump(&mut h, Command::Window(Operation::Stack(true)));
+    assert!(
+        is_fully_onscreen(&mut h, 1),
+        "stacking must bring the focused window fully back into view"
+    );
+
+    // Scroll off-screen again, then unstack: the focused window moves out to
+    // its own column and must likewise be brought into view.
+    settle_scroll_offset(&mut h);
+    assert!(
+        !is_fully_onscreen(&mut h, 1),
+        "test setup: focused window should be off-screen before unstacking"
+    );
+
+    pump(&mut h, Command::Window(Operation::Stack(false)));
+    assert!(
+        is_fully_onscreen(&mut h, 1),
+        "unstacking must bring the focused window fully back into view"
     );
 }
