@@ -6,14 +6,179 @@ use objc2_core_foundation::CGPoint;
 use crate::commands::{Command, Direction, MoveFocus, Operation};
 use crate::config::{Config, MainOptions, WindowParams};
 use crate::ecs::display::FloatingLayer;
-use crate::ecs::{ActiveWorkspaceMarker, Position, Unmanaged, layout::LayoutStrip};
-use crate::ecs::{RepositionMarker, SpawnWindowTrigger};
+use crate::ecs::{
+    ActiveWorkspaceMarker, FocusedMarker, NativeFullscreenMarker, Position, Unmanaged,
+    layout::LayoutStrip,
+};
+use crate::ecs::{RepositionMarker, Scrolling, SpawnWindowTrigger};
 use crate::events::Event;
 use crate::manager::{Origin, Size, Window};
 use crate::platform::Modifiers;
 use crate::{assert_focused, assert_window_at, assert_window_size};
 
 use super::*;
+
+#[test]
+fn modifier_scroll_uses_native_momentum_without_synthetic_velocity() {
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::Scroll { delta: 1.0 },
+    ];
+
+    TestHarness::new()
+        .with_windows(3)
+        .on_iteration(1, |world, _state| {
+            let mut query = world.query_filtered::<&Scrolling, With<ActiveWorkspaceMarker>>();
+            let scrolling = query.single(world).expect("active workspace is scrolling");
+            assert!(scrolling.velocity.abs() < 0.0001);
+            assert!(scrolling.is_user_swiping);
+        })
+        .run(commands);
+}
+
+#[test]
+fn native_fullscreen_transition_removes_window_from_original_strip_without_focus_marker() {
+    const FULLSCREEN_WORKSPACE_ID: WorkspaceId = TEST_WORKSPACE_ID + 100;
+
+    TestHarness::new()
+        .with_windows(2)
+        .on_iteration(0, |world, state| {
+            let focused = world
+                .query_filtered::<Entity, With<FocusedMarker>>()
+                .iter(world)
+                .collect::<Vec<_>>();
+            for entity in focused {
+                world.entity_mut(entity).remove::<FocusedMarker>();
+            }
+
+            state.update_window(0, |window| {
+                window.workspace_id = FULLSCREEN_WORKSPACE_ID;
+                window.is_full_screen = true;
+            });
+            state.activate_workspace(TEST_DISPLAY_ID, FULLSCREEN_WORKSPACE_ID, true);
+        })
+        .on_iteration(1, |world, _state| {
+            let fullscreen_window = find_window_entity(0, world);
+            let sibling_window = find_window_entity(1, world);
+            let mut strips = world.query::<(&LayoutStrip, Option<&NativeFullscreenMarker>)>();
+
+            let original_strip = strips
+                .iter(world)
+                .find_map(|(strip, marker)| {
+                    (strip.id() == TEST_WORKSPACE_ID && marker.is_none()).then_some(strip)
+                })
+                .expect("original strip");
+            assert!(
+                !original_strip.contains(fullscreen_window),
+                "fullscreen window must not leave a reserved column in the original strip"
+            );
+            assert!(original_strip.contains(sibling_window));
+
+            let (fullscreen_strip, fullscreen_marker) = strips
+                .iter(world)
+                .find(|(strip, _)| strip.id() == FULLSCREEN_WORKSPACE_ID)
+                .expect("fullscreen strip");
+            assert!(fullscreen_strip.contains(fullscreen_window));
+            assert!(fullscreen_marker.is_some());
+        })
+        .on_iteration(2, |world, _state| {
+            let fullscreen_window = find_window_entity(0, world);
+            let sibling_window = find_window_entity(1, world);
+            let mut strips = world.query::<&LayoutStrip>();
+
+            let original_strip = strips
+                .iter(world)
+                .find(|strip| strip.id() == TEST_WORKSPACE_ID)
+                .expect("original strip");
+            assert!(original_strip.contains(fullscreen_window));
+            assert!(original_strip.contains(sibling_window));
+            assert_eq!(
+                original_strip
+                    .index_of(fullscreen_window)
+                    .expect("restored fullscreen window index"),
+                0
+            );
+            assert!(
+                strips
+                    .iter(world)
+                    .all(|strip| strip.id() != FULLSCREEN_WORKSPACE_ID)
+            );
+        })
+        .run(vec![
+            Event::Command {
+                command: Command::PrintState,
+            },
+            Event::SpaceChanged,
+            Event::SpaceDestroyed {
+                space_id: FULLSCREEN_WORKSPACE_ID,
+            },
+        ]);
+}
+
+#[test]
+fn frontmost_floating_window_is_focused_after_setup() {
+    let mut params = WindowParams::new(".*", None);
+    params.floating = Some(true);
+    let config: Config = (MainOptions::default(), vec![params]).into();
+
+    TestHarness::new()
+        .with_config(config)
+        .with_windows(1)
+        .with_focused_window(0)
+        .on_iteration(0, |world, _state| {
+            assert_focused!(world, 0);
+            let entity = find_window_entity(0, world);
+            assert!(world.entity(entity).contains::<Unmanaged>());
+        })
+        .run(vec![Event::MenuOpened { window_id: 0 }]);
+}
+
+/// Regression: a floating window placed by a grid rule must land at the active
+/// display's usable origin (menubar + padding offset), not at (0, 0). Dropping
+/// the display bounds origin previously sent grid windows to the primary
+/// display's top-left corner (and onto the wrong display in multi-display
+/// setups).
+#[test]
+fn floating_grid_window_uses_active_display_usable_origin() {
+    let options = MainOptions {
+        padding_left: Some(40),
+        padding_top: Some(15),
+        ..MainOptions::default()
+    };
+
+    let mut params = WindowParams::new(".*", None);
+    params.floating = Some(true);
+    // Cell (0,0) spanning the full 1x1 grid: origin should equal the usable
+    // top-left, independent of the display size.
+    params.grid = Some("1:1:0:0:1:1".to_string());
+    let config: Config = (options, vec![params]).into();
+
+    TestHarness::new()
+        .with_config(config)
+        .on_iteration(1, |world, state| {
+            let origin = Origin::new(0, 0);
+            let size = Size::new(TEST_WINDOW_WIDTH, TEST_WINDOW_HEIGHT);
+            let frame = IRect::from_corners(origin, origin + size);
+            let window = state.spawn_window(TEST_PROCESS_ID, TEST_WORKSPACE_ID, 0, frame);
+            world.trigger(SpawnWindowTrigger(vec![window]));
+        })
+        .on_iteration(3, |world, _state| {
+            // usable origin = (pad_left, menubar + pad_top) = (40, 20 + 15).
+            assert_window_at!(world, 0, 40, TEST_MENUBAR_HEIGHT + 15);
+        })
+        .run(vec![
+            Event::MenuOpened { window_id: 0 },
+            Event::Command {
+                command: Command::PrintState,
+            },
+            Event::Command {
+                command: Command::PrintState,
+            },
+            Event::Command {
+                command: Command::PrintState,
+            },
+        ]);
+}
 
 #[test]
 fn test_dont_focus() {
@@ -151,7 +316,7 @@ fn test_scrolling() {
             command: Command::PrintState,
         },
         Event::Swipe {
-            delta: 0.4,
+            delta: 0.2,
             fingers: 3,
         },
         Event::Command {
@@ -178,8 +343,8 @@ fn test_scrolling() {
         })
         .on_iteration(5, move |world, _state| {
             assert_window_at!(world, 0, -395, TEST_MENUBAR_HEIGHT);
-            assert_window_at!(world, 1, -24, TEST_MENUBAR_HEIGHT);
-            assert_window_at!(world, 2, 376, TEST_MENUBAR_HEIGHT);
+            assert_window_at!(world, 1, -382, TEST_MENUBAR_HEIGHT);
+            assert_window_at!(world, 2, 18, TEST_MENUBAR_HEIGHT);
         })
         .run(commands);
 }
@@ -765,9 +930,11 @@ fn mouse_outside_corner_still_changes_focus() {
 #[test]
 fn toggle_floating_layer_flips_state() {
     fn current_layer(world: &mut World) -> FloatingLayer {
-        let mut query = world.query_filtered::<&FloatingLayer, With<ActiveWorkspaceMarker>>();
+        let mut query = world.query::<&FloatingLayer>();
         *query
-            .single(world)
+            .query(world)
+            .iter()
+            .find(|layer| layer.workspace_id == TEST_WORKSPACE_ID)
             .expect("active workspace has FloatingLayer")
     }
 
@@ -787,13 +954,13 @@ fn toggle_floating_layer_flips_state() {
         .with_config(Config::default())
         .with_windows(3)
         .on_iteration(0, |world, _state| {
-            assert_eq!(current_layer(world), FloatingLayer::Front);
+            assert!(!current_layer(world).front);
         })
         .on_iteration(1, |world, _state| {
-            assert_eq!(current_layer(world), FloatingLayer::Behind);
+            assert!(current_layer(world).front);
         })
         .on_iteration(2, |world, _state| {
-            assert_eq!(current_layer(world), FloatingLayer::Front);
+            assert!(!current_layer(world).front);
         })
         .run(commands);
 }
@@ -1304,6 +1471,7 @@ fn test_reshuffle_leftmost_pins_strip_to_left_edge_with_stale_frame() {
         MainOptions {
             auto_center: Some(false),
             animation_speed: Some(30.0),
+            continuous_swipe: Some(false),
             ..Default::default()
         },
         vec![],
@@ -1501,11 +1669,11 @@ fn test_virtual_workspace_switch_hides_old_strip_with_animations() {
 }
 
 /// Stacking or unstacking the focused window must bring it fully back into
-/// view. Regression: stack_windows_handler mutated the strip but never
+/// view. Regression: `stack_windows_handler` mutated the strip but never
 /// reshuffled, so when the strip was scrolled such that the focused window's
 /// new column slot fell off-screen, the window stayed partially or fully
 /// invisible even though it kept focus. It now reshuffles around the focused
-/// window; the edge-clamp in reshuffle_layout_strip keeps the strip pinned to
+/// window; the edge-clamp in `reshuffle_layout_strip` keeps the strip pinned to
 /// the edges.
 #[test]
 fn test_stack_unstack_brings_focused_window_into_view() {

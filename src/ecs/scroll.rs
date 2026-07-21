@@ -63,8 +63,10 @@ fn swipe_gesture(
 ) {
     let swipe_sensitivity = config.swipe_sensitivity();
     let mut total_delta = 0.0;
+    let mut gesture_delta = 0.0;
     let mut touchpad_down = false;
     let mut has_scroll_event = false;
+    let mut has_gesture_event = false;
     let mut is_wheel_input = false;
 
     // Normalization: Touchpad deltas are typically small fractions.
@@ -90,10 +92,12 @@ fn swipe_gesture(
             Event::Swipe { delta, fingers }
                 if config
                     .swipe_gesture_fingers()
-                    .is_none_or(|fingers_configured| fingers_configured == *fingers) =>
+                    .is_some_and(|fingers_configured| fingers_configured == *fingers) =>
             {
                 total_delta += delta;
+                gesture_delta += delta;
                 has_scroll_event = true;
+                has_gesture_event = true;
             }
             _ => (),
         }
@@ -119,13 +123,22 @@ fn swipe_gesture(
         };
 
         let dt = time.delta_secs_f64();
-        let new_velocity = if dt > 0.0 {
-            total_delta * swipe_sensitivity / dt
+        let new_velocity = if has_gesture_event && dt > 0.0 {
+            gesture_delta * swipe_sensitivity / dt
         } else {
             0.0
         };
 
         if let Some(scrolling) = scrolling.as_mut() {
+            // Native modifier-scroll events already include macOS momentum.
+            // Add synthetic inertia only for raw multi-finger gestures.
+            scrolling.velocity = if has_gesture_event {
+                // Smoothen gesture velocity changes using EMA.
+                0.3 * new_velocity + 0.7 * scrolling.velocity
+            } else {
+                0.0
+            };
+            scrolling.is_user_swiping = true;
             scrolling.last_event = Instant::now();
             scrolling.position +=
                 total_delta * viewport_width * direction_modifier * swipe_sensitivity;
@@ -151,7 +164,7 @@ fn swipe_gesture(
                 velocity: if is_wheel_input { 0.0 } else { new_velocity },
                 position: f64::from(position.0.x)
                     + total_delta * viewport_width * direction_modifier * swipe_sensitivity,
-                is_user_swiping: if is_wheel_input { false } else { touchpad_down },
+                is_user_swiping: if is_wheel_input { false } else { true },
                 last_event: Instant::now(),
             });
         }
@@ -402,7 +415,7 @@ fn vertical_swipe_gesture(
             Event::VerticalSwipe { delta, fingers }
                 if config
                     .swipe_gesture_fingers()
-                    .is_none_or(|fingers_configured| fingers_configured == *fingers) =>
+                    .is_some_and(|fingers_configured| fingers_configured == *fingers) =>
             {
                 state.last_event = Some(Instant::now());
 

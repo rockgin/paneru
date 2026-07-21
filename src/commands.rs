@@ -15,7 +15,7 @@ mod query;
 use crate::config::Config;
 use crate::ecs::display::FloatingLayer;
 use crate::ecs::focus::FocusHistory;
-use crate::ecs::layout::{Column, LayoutStrip, StackItem};
+use crate::ecs::layout::{Column, LayoutStrip, StackItem, clamp_origin_to_viewport};
 use crate::ecs::params::{ActiveDisplay, ActiveDisplayMut, Windows};
 use crate::ecs::{
     ActiveDisplayMarker, ActiveWorkspaceMarker, Bounds, DockPosition, FocusedMarker,
@@ -128,6 +128,8 @@ pub enum Operation {
     Resize(ResizeDirection),
     /// Resizes the focused window by pixels (width/height +/- 100px).
     ResizeBy(ResizeBy),
+    /// Resizes the focused window to an exact display-width ratio.
+    SetWidth(f64),
     /// Toggles the focused window to full width or a preset width.
     FullWidth,
     /// Moves the focused window to the next available display.
@@ -595,7 +597,7 @@ fn command_raise_floating(
 fn command_toggle_floating_layer(
     mut messages: MessageReader<Event>,
     active_display: ActiveDisplay,
-    mut active_workspace: Single<(&LayoutStrip, &mut FloatingLayer), With<ActiveWorkspaceMarker>>,
+    mut floating_layers: Query<&mut FloatingLayer>,
     focus_history: Res<FocusHistory>,
     window_manager: Res<WindowManager>,
     windows: Windows,
@@ -611,24 +613,41 @@ fn command_toggle_floating_layer(
     }
 
     let display_bounds = active_display.bounds();
-    let (active_strip, layer) = &mut *active_workspace;
+    let active_strip = active_display.active_strip();
     let workspace_id = active_strip.id();
-    let target_layer = layer.flipped();
+
+    let floating_front = floating_layers
+        .iter_mut()
+        .find_map(|mut layer| {
+            if layer.workspace_id == workspace_id {
+                layer.flip();
+                Some(layer.front)
+            } else {
+                None
+            }
+        })
+        .unwrap_or_else(|| {
+            let layer = FloatingLayer::new(workspace_id);
+            commands.spawn((layer, ChildOf(active_display.entity())));
+            false
+        });
+
     let visible_floats =
         visible_floating_entities(&windows, &window_manager, workspace_id, display_bounds);
     let visible_float = |entity: Entity| -> bool {
         visible_floats.contains(&entity) && !active_strip.contains(entity)
     };
 
-    let target = match target_layer {
-        FloatingLayer::Front => focus_history
+    let target = if floating_front {
+        focus_history
             .last_floating(workspace_id)
             .filter(|entity| visible_float(*entity))
-            .or_else(|| visible_floats.iter().copied().find(|e| visible_float(*e))),
-        FloatingLayer::Behind => focus_history
+            .or_else(|| visible_floats.iter().copied().find(|e| visible_float(*e)))
+    } else {
+        focus_history
             .last_managed(workspace_id)
             .filter(|entity| active_strip.contains(*entity))
-            .or_else(|| active_strip.all_columns().into_iter().next()),
+            .or_else(|| active_strip.all_columns().into_iter().next())
     };
 
     let mut raise = |entity: Entity| {
@@ -639,20 +658,20 @@ fn command_toggle_floating_layer(
             window.raise_without_focus();
         }
     };
-    match target_layer {
-        FloatingLayer::Behind => active_strip.all_windows().into_iter().for_each(&mut raise),
-        FloatingLayer::Front => windows
+    if floating_front {
+        windows
             .iter()
             .filter_map(|(_, e)| visible_float(e).then_some(e))
-            .for_each(raise),
+            .for_each(raise);
+    } else {
+        active_strip.all_windows().into_iter().for_each(&mut raise);
     }
 
     if let Some(entity) = target {
         commands.focus_entity(entity, true);
     }
 
-    **layer = target_layer;
-    debug!("floating layer -> {target_layer:?}");
+    debug!("floating layer -> front: {floating_front}");
 }
 
 /// Handles the "swap" command, swapping the positions of the current window with another window in a specified direction.
@@ -865,9 +884,10 @@ fn resize_window(
     config: Res<Config>,
     mut commands: Commands,
 ) {
-    let Some(Operation::Resize(direction)) =
-        filter_window_operations(&mut messages, |op| matches!(op, Operation::Resize(_))).next()
-    else {
+    let Some(operation) = filter_window_operations(&mut messages, |op| {
+        matches!(op, Operation::Resize(_) | Operation::SetWidth(_))
+    })
+    .next() else {
         return;
     };
 
@@ -888,8 +908,9 @@ fn resize_window(
     let widths = config.preset_column_widths();
     let fallback = *widths.first().unwrap_or(&0.5);
     let cycle = config.window_resize_cycle();
-    let next_ratio = match direction {
-        ResizeDirection::Grow => widths
+    let next_ratio = match operation {
+        Operation::SetWidth(ratio) if ratio.is_finite() && *ratio > 0.0 => *ratio,
+        Operation::Resize(ResizeDirection::Grow) => widths
             .iter()
             .copied()
             .find(|&r| r > current_ratio + 0.05)
@@ -900,7 +921,7 @@ fn resize_window(
                     *widths.last().unwrap_or(&fallback)
                 }
             }),
-        ResizeDirection::Shrink => widths
+        Operation::Resize(ResizeDirection::Shrink) => widths
             .iter()
             .rev()
             .copied()
@@ -912,13 +933,17 @@ fn resize_window(
                     fallback
                 }
             }),
+        _ => return,
     };
 
     let new_width = (next_ratio * f64::from(viewport.width())).round() as i32;
     let size = Size::new(new_width, frame.height());
 
-    let mut origin = IRect::from_center_size(frame.center(), size).min;
-    origin.x = origin.x.clamp(viewport.min.x, viewport.max.x - size.x);
+    let origin = clamp_origin_to_viewport(
+        IRect::from_center_size(frame.center(), size).min,
+        size,
+        viewport,
+    );
     commands.reposition_entity(entity, origin);
 
     // Resize all windows in the column so stacked siblings share the new width.
@@ -1487,9 +1512,7 @@ fn snap_window(
     // Clamp the frame into the display and reposition the *strip* (not the
     // window) so the layout stays consistent.
     let size = frame.size();
-    frame.min = frame
-        .min
-        .clamp(display_bounds.min, display_bounds.max - size);
+    frame.min = clamp_origin_to_viewport(frame.min, size, display_bounds);
     frame.max = frame.min + size;
 
     let strip_position = frame.min - layout_position.0;
