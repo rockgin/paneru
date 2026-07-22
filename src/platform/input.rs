@@ -609,13 +609,4 @@ mod tests {
         assert!(!gesture_should_intercept(Some(4), 3));
         assert!(gesture_should_intercept(Some(4), 4));
     }
-
-    #[test]
-    fn only_intercepts_the_explicitly_configured_gesture() {
-        assert!(!gesture_should_intercept(None, 3));
-        assert!(!gesture_should_intercept(Some(2), 2));
-        assert!(gesture_should_intercept(Some(3), 3));
-        assert!(!gesture_should_intercept(Some(4), 3));
-        assert!(gesture_should_intercept(Some(4), 4));
-    }
 }
