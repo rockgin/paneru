@@ -147,7 +147,7 @@ fn swipe_gesture(
                 // 鼠标滚轮不需要惯性滚动：velocity 清零，
                 // 避免 scrolling_integrator 在后续帧中再次叠加 position。
                 scrolling.velocity = 0.0;
-                scrolling.is_user_swiping = false;
+                scrolling.is_user_swiping = true;
                 trace!("wheel scroll: position updated, velocity zeroed");
             } else {
                 // 触摸板：通过 EMA 更新 velocity，启用惯性及 snapping
@@ -164,7 +164,7 @@ fn swipe_gesture(
                 velocity: if is_wheel_input { 0.0 } else { new_velocity },
                 position: f64::from(position.0.x)
                     + total_delta * viewport_width * direction_modifier * swipe_sensitivity,
-                is_user_swiping: if is_wheel_input { false } else { true },
+                is_user_swiping: true,
                 last_event: Instant::now(),
             });
         }
