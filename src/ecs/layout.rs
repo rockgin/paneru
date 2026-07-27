@@ -1050,10 +1050,13 @@ fn reshuffle_layout_strip(
         let mut strip_position = (frame.min - layout_position.0).with_y(display_bounds.min.y);
 
         // Enforce the edge invariant when auto-center is off: the leftmost
-        // window must touch the left edge and the rightmost the right edge
-        // if more than 1 windows in workspace.
+        // window must touch the left edge and the rightmost the right edge.
+        // Only applies to multi-column strips — a single window keeps its
+        // on-screen position (e.g. centered) without being pinned to the
+        // left edge.
         if !config.auto_center()
             && !config.continuous_swipe()
+            && strip.len() > 1
             && let Some(total_strip_width) = strip
                 .last()
                 .ok()
