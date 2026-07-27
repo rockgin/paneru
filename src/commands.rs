@@ -130,8 +130,6 @@ pub enum Operation {
     ResizeBy(ResizeBy),
     /// Resizes the focused window to an exact display-width ratio.
     SetWidth(f64),
-    /// Resizes the focused window to an exact display-width ratio.
-    SetWidth(f64),
     /// Toggles the focused window to full width or a preset width.
     FullWidth,
     /// Moves the focused window to the next available display.
