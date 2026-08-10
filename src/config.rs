@@ -189,6 +189,17 @@ fn parse_direction(dir: &str) -> Result<Direction> {
     })
 }
 
+fn parse_focus_direction(dir: &str) -> Result<Direction> {
+    match dir.parse::<usize>() {
+        Ok(0) => Err(Error::InvalidConfig(format!(
+            "{}: Window numbers start at 1",
+            function_name!()
+        ))),
+        Ok(number) => Ok(Direction::Nth(number - 1)),
+        Err(_) => parse_direction(dir),
+    }
+}
+
 fn parse_virtual_workspace_number(input: &str) -> Result<u32> {
     let number = input.parse::<u32>().map_err(|_| {
         Error::InvalidConfig(format!(
@@ -239,7 +250,7 @@ fn parse_operation(argv: &[&str]) -> Result<Operation> {
         "focus" => match *argv.get(1).ok_or(err.clone())? {
             "unmanaged" => Operation::FocusUnmanaged,
             "managed" => Operation::FocusManaged,
-            dir => Operation::Focus(parse_direction(dir)?),
+            dir => Operation::Focus(parse_focus_direction(dir)?),
         },
         "raise" => match *argv.get(1).ok_or(err.clone())? {
             "floating" => Operation::RaiseFloating,
@@ -882,6 +893,12 @@ impl Config {
             .insert_windows_mid_strip
             .is_some_and(|enabled| enabled)
     }
+
+    pub fn create_workspace_automatically(&self) -> bool {
+        self.options()
+            .create_virtual_workspace_automatically
+            .is_some_and(|enabled| enabled)
+    }
 }
 
 fn parse_hex_color(hex: &str) -> (f64, f64, f64) {
@@ -1152,6 +1169,10 @@ pub struct MainOptions {
     /// shifting the rest) instead of appending it to the end of the strip.
     /// Off by default.
     pub insert_windows_mid_strip: Option<bool>,
+
+    /// If a non-enumerated (e.g. South) gesture or window movement would target a nonexistent
+    /// virtual workspace, create the workspace automatically.
+    pub create_virtual_workspace_automatically: Option<bool>,
 }
 
 /// Returns a default set of column widths.
