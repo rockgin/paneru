@@ -21,8 +21,8 @@ use crate::ecs::layout::LayoutStrip;
 use crate::ecs::params::{ActiveDisplay, GlobalState, WindowCtx, Windows};
 use crate::ecs::workspace::RestoreFocusMarker;
 use crate::ecs::{
-    ActiveWorkspaceMarker, Bounds, Position, RaiseWindow, Scrolling, SendMessageTrigger,
-    SpawnCommandsExt, StrayFocusEvent,
+    ActiveWorkspaceMarker, Bounds, Position, RaiseWindow, ResizeMarker, Scrolling,
+    SendMessageTrigger, SpawnCommandsExt, StrayFocusEvent,
 };
 use crate::events::Event;
 use crate::manager::{Application, Display, Window, WindowManager};
@@ -97,7 +97,7 @@ pub struct FocusEventsPlugin;
 impl Plugin for FocusEventsPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<FocusHistory>();
-        app.add_systems(Update, detect_focus_rejection);
+        app.add_systems(Update, (detect_focus_rejection, fix_window_size_on_focus));
         app.add_systems(
             PostUpdate,
             (
@@ -192,6 +192,21 @@ fn shares_a_tab_group(
             target_frame.min.chebyshev_distance(actual_frame.min) <= 1
                 && target_frame.size().chebyshev_distance(actual_frame.size()) <= 1
         })
+}
+
+#[instrument(level = Level::DEBUG, skip_all, fields(focused))]
+fn fix_window_size_on_focus(
+    focused: Single<Entity, Added<FocusedMarker>>,
+    mut windows: Query<(&mut Window, &mut Bounds, Has<ResizeMarker>)>,
+) {
+    if let Ok((mut window, mut bounds, resizing)) = windows.get_mut(*focused)
+        && !resizing
+        && let Ok(frame) = window.update_frame()
+        && frame.size() != bounds.0
+    {
+        debug!("fixing window {} size!", window.id());
+        bounds.0 = frame.size();
+    }
 }
 
 #[instrument(level = Level::DEBUG, skip_all, fields(focused))]
