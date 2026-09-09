@@ -1,5 +1,5 @@
 use std::sync::mpsc::Receiver;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use bevy::MinimalPlugins;
 use bevy::app::App as BevyApp;
@@ -419,22 +419,6 @@ pub enum DockPosition {
     Left(i32),
     Right(i32),
     Hidden,
-}
-
-#[derive(Component)]
-pub struct RefreshWindowSizes(pub Instant);
-
-impl Default for RefreshWindowSizes {
-    fn default() -> Self {
-        Self(Instant::now())
-    }
-}
-
-impl RefreshWindowSizes {
-    pub fn ready(&self) -> bool {
-        const REFRESH_WINDOW_SIZE_DELAY_SEC: u64 = 5;
-        self.0.elapsed() > Duration::from_secs(REFRESH_WINDOW_SIZE_DELAY_SEC)
-    }
 }
 
 #[derive(Component)]
